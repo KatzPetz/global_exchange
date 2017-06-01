@@ -1,53 +1,43 @@
-
 local insecure_env = minetest.request_insecure_environment()
-assert(insecure_env,
-	"global_exchange needs to be trusted to run under mod security.")
+assert(insecure_env, "global_exchange needs to be trusted to run under mod security.")
 
 local modpath = minetest.get_modpath(minetest.get_current_modname()) .. "/"
 
-local income = tonumber(minetest.setting_get("citizens_income")) or 10
-local income_interval = 1200
-local income_msg = "You receive your citizen's income (+" .. income .. ")"
+local exchange = assert(loadfile(modpath .. "exchange.lua"))(insecure_env).
+   open_exchange(minetest.get_worldpath() .. "/global_exchange.db")
 
-local next_payout = os.time() + income_interval
-
-local exchange =
-        assert(loadfile(modpath .. "exchange.lua"))(insecure_env).open_exchange(
-		minetest.get_worldpath() .. "/global_exchange.db"
-)
-
+local formlib = assert(loadfile(modpath .. "formlib.lua"))()
 
 minetest.register_on_shutdown(function()
-	exchange:close()
+   exchange:close()
 end)
 
-
-local function check_giving()
-	local now = os.time()
-	if now < next_payout then
-		return
-	end
-
-	next_payout = now + income_interval
-
-	for _, player in ipairs(minetest.get_connected_players()) do
-		local p_name = player:get_player_name()
-
-		local succ = exchange:give_credits(p_name, income,
-			"Citizen's Income (+" .. income .. ")")
-
-		if succ then
-			minetest.chat_send_player(p_name, income_msg)
-		end
-	end
-
-	minetest.after(5, check_giving)
+local function handle_setbalance_command(caller, name, newbalance)
+   return exchange:set_balance(name, newbalance)
 end
 
-minetest.after(5, check_giving)
+minetest.register_privilege("balance", {
+   description = "Can use /setbalance",
+   give_to_singleplayer = false
+})
 
+minetest.register_chatcommand("setbalance", {
+   params      = "[<name>] <balance>",
+   description = "set a player's trading balance",
+   privs       = {balance=true},
+   func = function(caller, param)
+      local name, balancestr = string.match(param, "([^ ]+) ([0-9]+)")
+      if not name or not balancestr then
+         name = caller
+         balancestr = string.match(param, "([0-9]+)")
+         if not balancestr then
+            return false, "Invalid parameters (see /help setbalance)"
+         end
+      end
+      return handle_setbalance_command(caller, name, tonumber(balancestr))
+   end,
+})
 
-
-assert(loadfile(modpath .. "atm.lua"))(exchange)
-assert(loadfile(modpath .. "exchange_machine.lua"))(exchange)
-assert(loadfile(modpath .. "digital_mailbox.lua"))(exchange)
+assert(loadfile(modpath .. "atm.lua"))(exchange, formlib)
+assert(loadfile(modpath .. "exchange_machine.lua"))(exchange, formlib)
+assert(loadfile(modpath .. "digital_mailbox.lua"))(exchange, formlib)

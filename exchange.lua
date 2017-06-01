@@ -3,6 +3,17 @@ local insecure_env = ...
 local sql = insecure_env.require("lsqlite3")
 local exports = {}
 
+local order_book_cache = (function(cache)
+	return function(ex_name)
+		local maybe_cache = cache[ex_name]
+		if not maybe_cache then
+			maybe_cache = {}
+			cache[ex_name] = maybe_cache
+		end
+		return maybe_cache
+	end
+end)({})
+
 local init_query = [=[
 BEGIN TRANSACTION;
 CREATE TABLE if not exists Credit
@@ -27,6 +38,7 @@ CREATE TABLE if not exists Orders
 	Type TEXT NOT NULL CHECK(Type IN ("buy", "sell")),
 	Time INTEGER NOT NULL,
 	Item TEXT NOT NULL,
+	Wear INTEGER NOT NULL CHECK(Wear >= 0 AND Wear <= 65535),
 	Amount INTEGER NOT NULL CHECK(Amount > 0),
 	Rate INTEGER NOT NULL CHECK(Rate > 0)
 );
@@ -36,20 +48,21 @@ CREATE TABLE if not exists Inbox
 	Id INTEGER PRIMARY KEY AUTOINCREMENT,
 	Recipient TEXT NOT NULL,
 	Item TEXT NOT NULL,
+	Wear INTEGER NOT NULL CHECK(Wear >= 0 AND Wear <= 65535),
 	Amount INTEGER NOT NULL CHECK(Amount > 0)
 );
-
-CREATE INDEX if not exists credit_owner
-ON Credit (Owner);
 
 CREATE INDEX if not exists index_log
 ON Log (Recipient, Time);
 
 CREATE INDEX if not exists index_orders
-ON Orders (Poster, Type, Time, Item, Rate);
+ON Orders (Exchange, Type, Item, Rate, Wear, Time);
+
+CREATE INDEX if not exists index_own_orders
+ON Orders (Poster, Time);
 
 CREATE INDEX if not exists index_inbox
-ON Inbox (Recipient);
+ON Inbox (Recipient, Item, Wear);
 
 CREATE VIEW if not exists distinct_items AS
 SELECT DISTINCT Item FROM Orders;
@@ -83,128 +96,142 @@ FROM distinct_items;
 END TRANSACTION;
 ]=]
 
-
 local new_act_query = [=[
 INSERT INTO Credit (Owner, Balance)
-VALUES (:owner,:start_balance);
+VALUES (:owner, :start_balance);
 ]=]
-
 
 local get_balance_query = [[
 SELECT Balance FROM Credit
 WHERE Owner = ?;
 ]]
 
-
 local set_balance_query = [[
 UPDATE Credit
-SET Balance = ?
-WHERE Owner = ?;
+SET Balance = :new_balance
+WHERE Owner = :p_name;
 ]]
-
 
 local log_query = [[
 INSERT INTO Log (Recipient, Time, Message)
-VALUES(?, ?, ?);
+VALUES(:recipient, :time, :message);
 ]]
 
-
-local search_desc_query = [=[
-SELECT * FROM Orders
-WHERE Exchange = :ex_name
-AND Type = :order_type
-AND Item = :item_name
-ORDER BY Rate DESC;
-]=]
-
-
 local add_order_query = [=[
-INSERT INTO Orders (Poster, Exchange, Type, Time, Item, Amount, Rate)
-VALUES (:p_name, :ex_name, :order_type, :time, :item_name, :amount, :rate);
+INSERT INTO Orders (Poster, Exchange, Type, Time, Item, Wear, Amount, Rate)
+VALUES (:p_name, :ex_name, :order_type, :time, :item_name, :wear, :amount, :rate);
 ]=]
-
 
 local del_order_query = [=[
 DELETE FROM Orders
 WHERE Id = ?;
 ]=]
 
-
 local reduce_order_query = [=[
 UPDATE Orders
-SET Amount = Amount - ?
-WHERE Id = ?;
+SET Amount = Amount - :delta
+WHERE Id = :id;
 ]=]
 
+local get_order_query = [=[
+SELECT * FROM Orders
+WHERE Id = ?
+]=]
 
--- Delete an order while also checking the player.
 local cancel_order_query = [=[
 DELETE FROM Orders
 WHERE Id = :id
 AND Poster = :p_name
 ]=]
 
-
-local refund_order_query = [=[
-UPDATE Credit
-SET Balance = Balance + coalesce((
-      SELECT sum(Rate * Amount) FROM Orders
-      WHERE Poster = :p_name
-      AND Type = "buy"
-      AND Id = :id
-    ), 0)
-WHERE Owner = :p_name;
-]=]
-
-
-local search_asc_query = [=[
+local search_bids_query = [=[
 SELECT * FROM Orders
 WHERE Exchange = :ex_name
-AND Type = :order_type
+AND Type = "buy"
 AND Item = :item_name
-ORDER BY Rate ASC;
+ORDER BY Rate ASC, Wear DESC;
 ]=]
 
-local search_min_query = [=[
+local search_asks_query = [=[
 SELECT * FROM Orders
 WHERE Exchange = :ex_name
-AND Type = :order_type
+AND Type = "sell"
+AND Item = :item_name
+ORDER BY Rate DESC, Wear ASC;
+]=]
+
+local qual_bids_query = [=[
+SELECT * FROM Orders
+WHERE Exchange = :ex_name
+AND Type = "buy"
 AND Item = :item_name
 AND Rate >= :rate_min
-ORDER BY Rate DESC;
+AND Wear >= :wear_min
+ORDER BY Rate DESC, Time ASC;
 ]=]
 
-
-local search_max_query = [=[
+local qual_asks_query = [=[
 SELECT * FROM Orders
 WHERE Exchange = :ex_name
-AND Type = :order_type
+AND Type = "sell"
 AND Item = :item_name
 AND Rate <= :rate_max
-ORDER BY Rate ASC;
+AND Wear <= :wear_max
+ORDER BY Rate ASC, Time ASC;
 ]=]
-
 
 local search_own_query = [=[
 SELECT * FROM Orders
-WHERE Poster = :p_name;
+WHERE Poster = ?
+ORDER BY Time ASC;
 ]=]
 
+local order_book_asks_query = [=[
+SELECT Type, Rate, Wear, SUM(Amount) AS Amount FROM Orders
+GROUP BY Rate, Wear
+HAVING Exchange = :ex_name
+AND Type = "sell"
+AND Item = :item_name
+ORDER BY Rate ASC, Wear ASC
+LIMIT 3;
+]=]
+
+local order_book_bids_query = [=[
+SELECT Type, Rate, Wear, SUM(Amount) AS Amount FROM Orders
+GROUP BY Rate, Wear
+HAVING Exchange = :ex_name
+AND Type = "buy"
+AND Item = :item_name
+ORDER BY Rate DESC, Wear DESC
+LIMIT 3;
+]=]
 
 local insert_inbox_query = [=[
-INSERT INTO Inbox(Recipient, Item, Amount)
-VALUES(?, ?, ?);
+INSERT INTO Inbox(Recipient, Item, Wear, Amount)
+VALUES(:p_name, :item_name, :wear, :amount);
 ]=]
 
+local add_inbox_query = [=[
+UPDATE Inbox
+SET Amount = Amount + :change
+WHERE Id = :id;
+]=]
 
 local view_inbox_query = [=[
 SELECT * FROM Inbox
-WHERE Recipient = ?;
+WHERE Recipient = ?
+ORDER BY Item ASC, Wear ASC;
 ]=]
 
+local search_inbox_query = [=[
+SELECT * FROM Inbox
+WHERE Recipient = :p_name
+AND Item = :item_name
+AND Wear = :wear;
+]=]
 
 local get_inbox_query = [=[
-SELECT Amount FROM Inbox
+SELECT Amount, Wear FROM Inbox
 WHERE Id = :id;
 ]=]
 
@@ -225,7 +252,7 @@ SELECT * FROM market_summary;
 
 local transaction_log_query = [=[
 SELECT Time, Message FROM Log
-WHERE Recipient = :p_name
+WHERE Recipient = ?
 ORDER BY Time DESC;
 ]=]
 
@@ -239,8 +266,9 @@ local function sql_error(err)
 end
 
 
-local function is_integer(num)
-	return num%1 == 0
+local function is_integer(x)
+	local num = tonumber(x)
+	return num and math.floor(num) == num
 end
 
 
@@ -270,32 +298,37 @@ function exports.open_exchange(path)
 	end
 
 	local stmts = {
-		new_act_stmt = assert(db:prepare(new_act_query)),
-		get_balance_stmt = assert(db:prepare(get_balance_query)),
-		set_balance_stmt = assert(db:prepare(set_balance_query)),
-		log_stmt = assert(db:prepare(log_query)),
-		search_desc_stmt = assert(db:prepare(search_desc_query)),
-		search_asc_stmt = assert(db:prepare(search_asc_query)),
-		search_min_stmt = assert(db:prepare(search_min_query)),
-		search_max_stmt = assert(db:prepare(search_max_query)),
-		search_own_stmt = assert(db:prepare(search_own_query)),
-		add_order_stmt = assert(db:prepare(add_order_query)),
-		del_order_stmt = assert(db:prepare(del_order_query)),
-		reduce_order_stmt = assert(db:prepare(reduce_order_query)),
-		cancel_order_stmt = assert(db:prepare(cancel_order_query)),
-		refund_order_stmt = assert(db:prepare(refund_order_query)),
-		insert_inbox_stmt = assert(db:prepare(insert_inbox_query)),
-		view_inbox_stmt = assert(db:prepare(view_inbox_query)),
-		get_inbox_stmt = assert(db:prepare(get_inbox_query)),
-		red_inbox_stmt = assert(db:prepare(red_inbox_query)),
-		del_inbox_stmt = assert(db:prepare(del_inbox_query)),
-		summary_stmt = assert(db:prepare(summary_query)),
+		new_act_stmt         = assert(db:prepare(new_act_query)),
+		get_balance_stmt     = assert(db:prepare(get_balance_query)),
+		set_balance_stmt     = assert(db:prepare(set_balance_query)),
+		log_stmt             = assert(db:prepare(log_query)),
+		search_asks_stmt     = assert(db:prepare(search_asks_query)),
+		search_bids_stmt     = assert(db:prepare(search_bids_query)),
+		qual_asks_stmt       = assert(db:prepare(qual_asks_query)),
+		qual_bids_stmt       = assert(db:prepare(qual_bids_query)),
+		search_own_stmt      = assert(db:prepare(search_own_query)),
+		add_order_stmt       = assert(db:prepare(add_order_query)),
+		get_order_stmt       = assert(db:prepare(get_order_query)),
+		del_order_stmt       = assert(db:prepare(del_order_query)),
+		reduce_order_stmt    = assert(db:prepare(reduce_order_query)),
+		cancel_order_stmt    = assert(db:prepare(cancel_order_query)),
+		insert_inbox_stmt    = assert(db:prepare(insert_inbox_query)),
+		add_inbox_stmt       = assert(db:prepare(add_inbox_query)),
+		order_book_bids_stmt = assert(db:prepare(order_book_bids_query)),
+		order_book_asks_stmt = assert(db:prepare(order_book_asks_query)),
+		view_inbox_stmt      = assert(db:prepare(view_inbox_query)),
+		search_inbox_stmt    = assert(db:prepare(search_inbox_query)),
+		get_inbox_stmt       = assert(db:prepare(get_inbox_query)),
+		red_inbox_stmt       = assert(db:prepare(red_inbox_query)),
+		del_inbox_stmt       = assert(db:prepare(del_inbox_query)),
+		summary_stmt         = assert(db:prepare(summary_query)),
 		transaction_log_stmt = assert(db:prepare(transaction_log_query)),
 	}
 
 
-	local ret = { db = db,
-		      stmts = stmts,
+	local ret = {
+		db    = db,
+		stmts = stmts,
 	}
 	setmetatable(ret, ex_meta)
 
@@ -318,7 +351,11 @@ function ex_methods.log(self, message, recipient)
 	local db = self.db
 	local stmt = self.stmts.log_stmt
 
-	stmt:bind_values(recipient, os.time(), message)
+	stmt:bind_names({
+		recipient = recipient,
+		time      = os.time(),
+		message   = message,
+	})
 
 	local res = stmt:step()
 	stmt:reset()
@@ -351,9 +388,9 @@ function ex_methods.new_account(self, p_name, amt)
 	local stmt = self.stmts.new_act_stmt
 
 	stmt:bind_names({
-		owner = p_name,
+		owner         = p_name,
 		start_balance = amt,
-		time = os.time(),
+		time          = os.time(),
 	})
 
 	local res = stmt:step()
@@ -411,6 +448,7 @@ function ex_methods.get_balance(self, p_name)
 	end
 
 	stmt:reset()
+	return nil
 end
 
 
@@ -425,7 +463,11 @@ function ex_methods.set_balance(self, p_name, new_bal)
 		return false, p_name .. " does not have an account."
 	end
 
-	set_stmt:bind_values(new_bal, p_name)
+	set_stmt:bind_names({
+		p_name      = p_name,
+		new_balance = new_bal,
+	})
+
 	local res = set_stmt:step()
 
 	if res == sqlite3.ERROR then
@@ -445,7 +487,7 @@ end
 -- Change balance by the given amount. Returns a success boolean, and error
 -- message on fail.
 function ex_methods.change_balance(self, p_name, delta)
-	if not is_integer(delta)  then
+	if not is_integer(delta) then
 		error("Non-integer credit delta")
 	end
 
@@ -533,26 +575,68 @@ function ex_methods.give_credits(self, p_name, amt, msg)
 end
 
 
+-- The best asks & bids for an item, grouped and sorted by rate and wear.
+-- Result fields: Type, Rate, Wear, Amount.
+function ex_methods.order_book(self, ex_name, item_name)
+	if not ex_name or not item_name then return {} end
+
+	local ex_cache = order_book_cache(ex_name)
+	if ex_cache[item_name] then
+		return ex_cache[item_name]
+	end
+
+	local res = {}
+
+	local stmt = self.stmts.order_book_asks_stmt
+	stmt:bind_names({
+		ex_name   = ex_name,
+		item_name = item_name,
+	})
+
+	-- Insert asks in reverse order
+	for row in stmt:nrows() do
+		table.insert(res, 1, row)
+	end
+	
+	stmt:reset()
+
+	local stmt = self.stmts.order_book_bids_stmt
+	stmt:bind_names({
+		ex_name   = ex_name,
+		item_name = item_name,
+	})
+
+	-- Append bids in normal order
+	for row in stmt:nrows() do
+		table.insert(res, row)
+	end
+	
+	stmt:reset()
+
+	ex_cache[item_name] = res
+
+	return res
+end
+
+
 -- Returns a list of orders, sorted by price.
 function ex_methods.search_orders(self, ex_name, order_type, item_name)
 	local stmt
 	if order_type == "buy" then
-		stmt = self.stmts.search_asc_stmt
+		stmt = self.stmts.search_bids_stmt
 	else
-		stmt = self.stmts.search_desc_stmt
+		stmt = self.stmts.search_asks_stmt
 	end
 
 	stmt:bind_names({
-		ex_name = ex_name,
-		order_type = order_type,
+		ex_name   = ex_name,
 		item_name = item_name,
 	})
 
-	local orders,n = {},1
+	local orders = {}
 
 	for tab in stmt:nrows() do
-		orders[n] = tab
-		n = n+1
+		table.insert(orders, tab)
 	end
 
 	stmt:reset()
@@ -564,13 +648,12 @@ end
 function ex_methods.search_player_orders(self, p_name)
 	local stmt = self.stmts.search_own_stmt
 
-	stmt:bind_names({p_name = p_name})
+	stmt:bind_values(p_name)
 
-	local orders,n = {},1
+	local orders = {}
 
 	for tab in stmt:nrows() do
-		orders[n] = tab
-		n = n+1
+		table.insert(orders, tab)
 	end
 
 	stmt:reset()
@@ -579,34 +662,35 @@ end
 
 
 -- Adds a new order. Returns success, and an error string if failed.
-function ex_methods.add_order(self, p_name, ex_name, order_type, item_name, amount, rate)
-	if math.floor(amount) ~= amount then
+function ex_methods.add_order(self, p_name, ex_name, order_type, item_name, wear, amount, rate)
+	if not is_integer(amount) then
 		return false, "Noninteger quantity"
-	end
-
-	if amount <= 0 then
+	elseif amount <= 0 then
 		return false, "Nonpositive quantity"
-	end
-
-	if math.floor(rate) ~= rate then
+	elseif not is_integer(rate) then
 		return false, "Noninteger rate"
+	elseif rate <= 0 then
+		return false, "Nonpositive rate"
+	elseif not is_integer(wear) then
+		return false, "Noninteger wear"
+	elseif wear < 0 or wear > 65535 then
+		return false, "Invalid wear"
 	end
 
-	if rate <= 0 then
-		return false, "Nonpositive rate"
-	end
+	order_book_cache(ex_name)[item_name] = nil
 
 	local db = self.db
 	local stmt = self.stmts.add_order_stmt
 
 	stmt:bind_names({
-		p_name = p_name,
-		ex_name = ex_name,
+		p_name     = p_name,
+		ex_name    = ex_name,
 		order_type = order_type,
-		time = os.time(),
-		item_name = item_name,
-		amount = amount,
-		rate = rate,
+		time       = os.time(),
+		item_name  = item_name,
+		wear       = wear,
+		amount     = amount,
+		rate       = rate,
 	})
 
 	local res = stmt:step()
@@ -624,35 +708,43 @@ end
 
 
 -- Returns true, or false and an error message.
-function ex_methods.cancel_order(self, p_name, id, order_type, item_name, amount, rate)
-	local params = { p_name = p_name,
-			 id = id,
+function ex_methods.cancel_order(self, p_name, id)
+	local params = {
+		p_name = p_name,
+		id     = id,
 	}
 
 	local db = self.db
 	db:exec("BEGIN TRANSACTION;")
 
-	local refund_stmt = self.stmts.refund_order_stmt
-	local cancel_stmt = self.stmts.cancel_order_stmt
+	local get_stmt = self.stmts.get_order_stmt
+	get_stmt:bind_values(id)
+	local res = get_stmt:step()
+	local order
 
-	local ref_succ, ref_err = exec_stmt(db, refund_stmt, params)
-	if not ref_succ then
-		db:exec("ROLLBACK")
-		return false, ref_err
+	if res == sqlite3.ERROR then
+		sql_error(db:errmsg())
+	elseif res == sqlite3.MISUSE then
+		error("Programmer error.")
+	elseif res == sqlite3.ROW then
+		order = get_stmt:get_named_values()
+		get_stmt:reset()
+	else
+		db:exec("ROLLBACK;")
+		return false, "No such order."
 	end
 
+	order_book_cache(order.Exchange)[order.Item] = nil
+
+	local cancel_stmt = self.stmts.cancel_order_stmt
 	local canc_succ, canc_err = exec_stmt(db, cancel_stmt, params)
 	if not canc_succ then
-		db:exec("ROLLBACK")
+		db:exec("ROLLBACK;")
 		return false, canc_err
 	end
 
 	local message = "Cancelled an order to " ..
-		order_type .. " " .. amount .. " " .. item_name .. "."
-
-	if order_type == "buy" then
-		message = message .. " (+" .. amount * rate .. ")"
-	end
+		order.Type .. " " .. order.Amount .. " " .. order.Item .. "."
 
 	local succ, err = self:log(message, p_name)
 	if not succ then
@@ -662,26 +754,72 @@ function ex_methods.cancel_order(self, p_name, id, order_type, item_name, amount
 
 	db:exec("COMMIT;")
 
-	return true
+	return true, order
 end
 
 
 -- Puts things in a player's item inbox. Returns success, and also returns an
 -- error message if failed.
-function ex_methods.put_in_inbox(self, p_name, item_name, amount)
+function ex_methods.put_in_inbox(self, p_name, item_name, wear, amount)
 	local db = self.db
-	local stmt = self.stmts.insert_inbox_stmt
+	local search_stmt = self.stmts.search_inbox_stmt
 
-	stmt:bind_values(p_name, item_name, amount)
+	db:exec("BEGIN TRANSACTION;")
+
+	search_stmt:bind_names({
+		p_name    = p_name,
+		item_name = item_name,
+		wear      = wear,
+	})
+
+	local res = search_stmt:step()
+	local row = nil
+
+	if res == sqlite3.BUSY then
+		search_stmt:reset()
+		db:exec("ROLLBACK;")
+		return false, "Database Busy."
+	elseif res == sqlite3.ROW then
+		row = search_stmt:get_named_values()
+	elseif res ~= sqlite3.DONE then
+		sql_error(db:errmsg())
+	end
+
+	search_stmt:reset()
+
+	local stmt
+
+	if row then
+		stmt = self.stmts.add_inbox_stmt
+
+		stmt:bind_names({
+			id     = row.Id,
+			change = amount,
+		})
+	else
+		stmt = self.stmts.insert_inbox_stmt
+
+		stmt:bind_names({
+			p_name    = p_name,
+			item_name = item_name,
+			wear      = wear,
+			amount    = amount,
+		})
+	end
 
 	local res = stmt:step()
+
 	if res == sqlite3.BUSY then
+		stmt:reset()
+		db:exec("ROLLBACK;")
 		return false, "Database Busy."
 	elseif res ~= sqlite3.DONE then
 		sql_error(db:errmsg())
 	end
 
 	stmt:reset()
+
+	db:exec("COMMIT;")
 
 	return true
 end
@@ -690,7 +828,7 @@ end
 -- Tries to buy from orders at the provided rate, and posts an offer with any
 -- remaining desired amount. Returns success. If succeeded, also returns amount
 -- bought. If failed, returns an error message
-function ex_methods.buy(self, p_name, ex_name, item_name, amount, rate)
+function ex_methods.buy(self, p_name, ex_name, item_name, wear, amount, rate)
 	if not is_integer(amount) then
 		return false, "Noninteger quantity"
 	elseif amount <= 0 then
@@ -699,146 +837,141 @@ function ex_methods.buy(self, p_name, ex_name, item_name, amount, rate)
 		return false, "Noninteger rate"
 	elseif rate <= 0 then
 		return false, "Nonpositive rate"
+	elseif not is_integer(wear) then
+		return false, "Noninteger wear"
+	elseif wear < 0 or wear > 65535 then
+		return false, "Invalid wear"
 	end
 
 	local db = self.db
 
-	local bal = self:get_balance(p_name)
-
-	if not bal then
-		return false, "Nonexistent account."
-	end
-
-	if bal < amount * rate then
-		return false, "Not enough money."
-	end
-
-
 	db:exec("BEGIN TRANSACTION");
 
+	local balance = self:get_balance(p_name)
+	
+	if not balance then
+		db:exec("ROLLBACK;")
+		return false, p_name .. " does not have an account."
+	end
+
+	local bought = {}
 	local remaining = amount
 
 	local del_stmt = self.stmts.del_order_stmt
 	local red_stmt = self.stmts.reduce_order_stmt
-	local search_stmt = self.stmts.search_max_stmt
+	local search_stmt = self.stmts.qual_asks_stmt
 
 	search_stmt:bind_names({
-		ex_name = ex_name,
-		order_type = "sell",
+		ex_name   = ex_name,
 		item_name = item_name,
-		rate_max = rate,
+		rate_max  = rate,
+		wear_max  = wear,
 	})
 
 	for row in search_stmt:nrows() do
-		local poster = row.Poster
+		local poster     = row.Poster
+		local row_wear   = row.Wear
 		local row_amount = row.Amount
+		local row_rate   = row.Rate
+		local row_bought = math.min(row_amount, remaining)
 
-		if row_amount <= remaining then
-			del_stmt:bind_values(row.Id)
-
-			local del_res = del_stmt:step()
-			if del_res == sqlite3.BUSY then
-				del_stmt:reset()
-				search_stmt:reset()
-				db:exec("ROLLBACK;")
-				return false, "Database Busy."
-			elseif del_res ~= sqlite3.DONE then
-				sql_error(db:errmsg())
-			end
-			del_stmt:reset()
-
-			local ch_succ, ch_err =
-				self:change_balance(poster, rate * row_amount)
-			if not ch_succ then
-				search_stmt:reset()
-				db:exec("ROLLBACK;")
-				return false, ch_err
-			end
-
-			local log_succ, log_err =
-				self:log(p_name .. " bought " .. row_amount .. " "
-						 .. item_name .. " from you. (+"
-						 .. rate * row_amount .. ")", poster)
-			if not log_succ then
-				search_stmt:reset()
-				db:exec("ROLLBACK;")
-				return false, log_err
-			end
-
-			local log2_succ, log2_err =
-				self:log("Bought " .. row_amount .. " " .. item_name
-						 .. " from " .. poster
-						 .. "(-" .. rate * row_amount .. ")",p_name)
-			if not log2_succ then
-				search_stmt:reset()
-				db:exec("ROLLBACK;")
-				return false, log2_err
-			end
-
-			remaining = remaining - row_amount
-		else -- row_amount > remaining
-			red_stmt:bind_values(remaining, row.Id)
-
-			local red_res = red_stmt:step()
-			if red_res == sqlite3.BUSY then
-				red_stmt:reset()
-				search_stmt:reset()
-				db:exec("ROLLBACK;")
-				return false, "Database Busy."
-			elseif red_res ~= sqlite3.DONE then
-				red_stmt:reset()
-				search_stmt:reset()
-				sql_error(db:errmsg())
-			end
-			red_stmt:reset()
-
-			local ch_succ, ch_err =
-				self:change_balance(poster, rate * remaining)
-			if not ch_succ then
-				search_stmt:reset()
-				db:exec("ROLLBACK;")
-				return false, ch_err
-			end
-
-			local log_succ, log_err =
-				self:log(p_name .. " bought " .. remaining .. " "
-						 .. item_name .. " from you. (+"
-						 .. rate * remaining .. ")", poster)
-			if not log_succ then
-				search_stmt:reset()
-				db:exec("ROLLBACK;")
-				return false, log_err
-			end
-
-			local log2_succ, log2_err =
-				self:log("Bought " .. remaining .. " " .. item_name
-						 .. " from " .. poster .. " (-"
-						 .. rate * remaining .. ")", p_name)
-			if not log2_succ then
-				search_stmt:reset()
-				db:exec("ROLLBACK;")
-				return false, log2_err
-			end
-
-			remaining = 0
+		if poster ~= p_name then
+			local can_afford = math.floor(balance / row_rate)
+			row_bought = math.min(row_bought, can_afford)
+			-- asking prices can only increase from here
+			if row_bought == 0 then break end
 		end
+
+		local red_del_stmt
+
+		if row_bought < row_amount then
+			red_stmt:bind_names({
+				id    = row.Id,
+				delta = row_bought,
+			})
+			red_del_stmt = red_stmt
+		else -- row_bought == row_amount
+			del_stmt:bind_values(row.Id)
+			red_del_stmt = del_stmt
+		end
+
+		local red_del_res = red_del_stmt:step()
+		if red_del_res == sqlite3.BUSY then
+			red_del_stmt:reset()
+			search_stmt:reset()
+			db:exec("ROLLBACK;")
+			return false, "Database Busy."
+		elseif red_del_res ~= sqlite3.DONE then
+			red_del_stmt:reset()
+			search_stmt:reset()
+			sql_error(db:errmsg())
+		end
+		red_del_stmt:reset()
+
+		if poster ~= p_name then
+			local cost = row_rate * row_bought
+
+			local ch_succ, ch_err = self:change_balance(poster, cost)
+			if not ch_succ then
+				search_stmt:reset()
+				db:exec("ROLLBACK;")
+				return false, ch_err
+			end
+
+			local ch_succ, ch_err = self:change_balance(p_name, -cost)
+			if not ch_succ then
+				search_stmt:reset()
+				db:exec("ROLLBACK;")
+				return false, ch_err
+			end
+
+			balance = balance - cost
+
+			local log_succ, log_err =
+				self:log(p_name .. " bought " .. row_amount .. " " ..
+						item_name .. " from you. (+" .. cost .. ")",
+						poster)
+			if not log_succ then
+				search_stmt:reset()
+				db:exec("ROLLBACK;")
+				return false, log_err
+			end
+
+			local log_succ, log_err =
+				self:log("Bought " .. row_amount .. " " .. item_name ..
+						" from " .. poster .. ". (-" .. cost .. ")",
+						p_name)
+			if not log_succ then
+				search_stmt:reset()
+				db:exec("ROLLBACK;")
+				return false, log_err
+			end
+		else
+			local log_succ, log_err =
+				self:log("Bought " .. row_amount .. " " ..
+				         item_name .. " from yourself.",
+				         p_name)
+			if not log_succ then
+				search_stmt:reset()
+				db:exec("ROLLBACK;")
+				return false, log_err
+			end
+		end
+
+		order_book_cache(ex_name)[item_name] = nil
+
+		table.insert(bought, { amount = row_bought, wear = row_wear })
+
+		remaining = remaining - row_bought
 
 		if remaining == 0 then break end
 	end
 
 	search_stmt:reset()
 
-	local bought = amount - remaining
-	local cost = amount * rate
-	local ch_succ, ch_err = self:change_balance(p_name, -cost)
-	if not ch_succ then
-		db:exec("ROLLBACK;")
-		return false, ch_err
-	end
-
 	if remaining > 0 then
 		local add_succ, add_err =
-			self:add_order(p_name, ex_name, "buy", item_name, remaining, rate)
+			self:add_order(p_name, ex_name, "buy", item_name, wear, remaining, rate)
 
 		if not add_succ then
 			db:exec("ROLLBACK;")
@@ -846,11 +979,9 @@ function ex_methods.buy(self, p_name, ex_name, item_name, amount, rate)
 		end
 
 		local log_succ, log_err =
-		self:log("Posted buy offer for "
-				 .. remaining .. " " .. item_name .. " at "
-				 .. rate .. "/item (-"
-				 .. remaining * rate .. ")", p_name)
-
+			self:log("Posted buy offer for " .. remaining .. " " ..
+			         item_name .. " at " .. rate .. "/ea.",
+					 p_name)
 		if not log_succ then
 			db:exec("ROLLBACK;")
 			return false, log_err
@@ -865,7 +996,7 @@ end
 
 -- Tries to sell to orders at the provided rate, and posts an offer with any
 -- remaining desired amount. Returns success. If failed, returns an error message.
-function ex_methods.sell(self, p_name, ex_name, item_name, amount, rate)
+function ex_methods.sell(self, p_name, ex_name, item_name, wear, amount, rate)
 	if not is_integer(amount) then
 		return false, "Noninteger quantity"
 	elseif amount <= 0 then
@@ -874,6 +1005,10 @@ function ex_methods.sell(self, p_name, ex_name, item_name, amount, rate)
 		return false, "Noninteger rate"
 	elseif rate <= 0 then
 		return false, "Nonpositive rate"
+	elseif not is_integer(wear) then
+		return false, "Noninteger wear"
+	elseif wear < 0 or wear > 65535 then
+		return false, "Invalid wear"
 	end
 
 	local db = self.db
@@ -881,133 +1016,136 @@ function ex_methods.sell(self, p_name, ex_name, item_name, amount, rate)
 	db:exec("BEGIN TRANSACTION");
 
 	local remaining = amount
-	local revenue = 0
 
 	local del_stmt = self.stmts.del_order_stmt
 	local red_stmt = self.stmts.reduce_order_stmt
-	local search_stmt = self.stmts.search_min_stmt
+	local search_stmt = self.stmts.qual_bids_stmt
 
 	search_stmt:bind_names({
-		ex_name = ex_name,
-		order_type = "buy",
+		ex_name   = ex_name,
 		item_name = item_name,
-		rate_min = rate,
+		rate_min  = rate,
+		wear_min  = wear,
 	})
 
 	for row in search_stmt:nrows() do
-		local poster = row.Poster
+		local poster     = row.Poster
 		local row_amount = row.Amount
+		local row_rate   = row.Rate
+		local row_sold   = math.min(row_amount, remaining)
 
-		if row_amount <= remaining then
-			del_stmt:bind_values(row.Id)
+		if poster ~= p_name then
+			local bal = self:get_balance(poster)
 
-			local del_res = del_stmt:step()
-			if del_res == sqlite3.BUSY then
-				del_stmt:reset()
+			if not bal then
 				search_stmt:reset()
 				db:exec("ROLLBACK;")
-				return false, "Database Busy."
-			elseif del_res ~= sqlite3.DONE then
-				sql_error(db:errmsg())
-			end
-			del_stmt:reset()
-
-			local in_succ, in_err =
-				self:put_in_inbox(poster, item_name, row_amount)
-			if not in_succ then
-				search_stmt:reset()
-				db:exec("ROLLBACK;")
-				return false, in_err
+				return false, poster .. " does not have an account."
 			end
 
-			local log_succ, log_err =
-				self:log(p_name .. " sold " .. row_amount .. " "
-						 .. item_name .. " to you." , poster)
-			if not log_succ then
-				search_stmt:reset()
-				db:exec("ROLLBACK;")
-				return false, log_err
-			end
-
-			local log2_succ, log2_err =
-				self:log("Sold " .. row_amount .. " " .. item_name
-						 .. " to " .. poster
-						 .. "(+" .. rate * row_amount .. ")",p_name)
-			if not log2_succ then
-				search_stmt:reset()
-				db:exec("ROLLBACK;")
-				return false, log2_err
-			end
-
-			remaining = remaining - row_amount
-			revenue = revenue + row_amount * row.Rate
-		else -- row_amount > remaining
-			red_stmt:bind_values(remaining, row.Id)
-
-			local red_res = red_stmt:step()
-			if red_res == sqlite3.BUSY then
-				red_stmt:reset()
-				search_stmt:reset()
-				db:exec("ROLLBACK;")
-				return false, "Database Busy."
-			elseif red_res ~= sqlite3.DONE then
-				red_stmt:reset()
-				search_stmt:reset()
-				sql_error(db:errmsg())
-			end
-			red_stmt:reset()
-
-			local in_succ, in_err =
-				self:put_in_inbox(poster, item_name, remaining)
-			if not in_succ then
-				search_stmt:reset()
-				db:exec("ROLLBACK;")
-				return false, in_err
-			end
-
-			local log_succ, log_err =
-				self:log(p_name .. " sold " .. remaining .. " "
-						 .. item_name .. " to you.", poster)
-			if not log_succ then
-				search_stmt:reset()
-				db:exec("ROLLBACK;")
-				return false, log_err
-			end
-
-			local log2_succ, log2_err =
-				self:log("Sold " .. row_amount .. " " .. item_name
-						 .. " to " .. poster .. " (+"
-						 .. rate * remaining .. ")", p_name)
-			if not log2_succ then
-				search_stmt:reset()
-				db:exec("ROLLBACK;")
-				return false, log2_err
-			end
-			
-			revenue = revenue + remaining * row.Rate
-			remaining = 0
+			local can_afford = math.floor(bal / row_rate)
+			row_sold = math.min(row_sold, can_afford)
 		end
 
-		if remaining == 0 then break end
+		if row_sold > 0 then
+			local red_del_stmt
+
+			if row_sold < row_amount then
+				red_stmt:bind_names({
+					id    = row.Id,
+					delta = row_sold,
+				})
+				red_del_stmt = red_stmt
+			else -- row_sold == row_amount
+				del_stmt:bind_values(row.Id)
+				red_del_stmt = del_stmt
+			end
+
+			local red_del_res = red_del_stmt:step()
+			red_del_stmt:reset()
+			if red_del_res == sqlite3.BUSY then
+				search_stmt:reset()
+				db:exec("ROLLBACK;")
+				return false, "Database Busy."
+			elseif red_del_res ~= sqlite3.DONE then
+				search_stmt:reset()
+				sql_error(db:errmsg())
+			end
+
+			local in_succ, in_err =
+				self:put_in_inbox(poster, item_name, wear, row_sold)
+			if not in_succ then
+				search_stmt:reset()
+				db:exec("ROLLBACK;")
+				return false, in_err
+			end
+
+			if poster ~= p_name then
+				local revenue = row_sold * row_rate
+
+				local ch_succ, ch_err = self:change_balance(poster, -revenue)
+				if not ch_succ then
+					search_stmt:reset()
+					db:exec("ROLLBACK;")
+					return false, ch_err
+				end
+
+				local ch_succ, ch_err = self:change_balance(p_name, revenue)
+				if not ch_succ then
+					search_stmt:reset()
+					db:exec("ROLLBACK;")
+					return false, ch_err
+				end
+
+				local log_succ, log_err =
+					self:log(p_name .. " sold " .. row_amount .. " " ..
+							item_name .. " to you. (-" .. revenue .. ")",
+							poster)
+				if not log_succ then
+					search_stmt:reset()
+					db:exec("ROLLBACK;")
+					return false, log_err
+				end
+
+				local log_succ, log_err =
+					self:log("Sold " .. row_amount .. " " .. item_name ..
+							" to " .. poster .. "(+" .. revenue .. ")",
+							p_name)
+				if not log_succ then
+					search_stmt:reset()
+					db:exec("ROLLBACK;")
+					return false, log_err
+				end
+			else
+				local log_succ, log_err =
+					self:log("Sold " .. row_amount .. " " ..
+					         item_name .. " to yourself.",
+					         p_name)
+				if not log_succ then
+					search_stmt:reset()
+					db:exec("ROLLBACK;")
+					return false, log_err
+				end
+			end
+
+			order_book_cache(ex_name)[item_name] = nil
+
+			remaining = remaining - row_sold
+
+			if remaining == 0 then break end
+		end
 	end
 
 	search_stmt:reset()
 
-	local ch_succ, ch_err = self:change_balance(p_name, revenue)
-	if not ch_succ then
-		db:exec("ROLLBACK;")
-		return false, ch_err
-	end
-
 	if remaining > 0 then
 		local add_succ, add_err =
-			self:add_order(p_name, ex_name, "sell", item_name, remaining, rate)
+			self:add_order(p_name, ex_name, "sell", item_name, wear, remaining, rate)
 
 		if not add_succ then
 			db:exec("ROLLBACK;")
 			return false, add_err
 		end
-
 	end
 
 	db:exec("COMMIT;")
@@ -1023,11 +1161,10 @@ function ex_methods.view_inbox(self, p_name)
 
 	stmt:bind_values(p_name)
 
-	local res,n = {},1
+	local res = {}
 
 	for row in stmt:nrows() do
-		res[n] = row
-		n = n+1
+		table.insert(res, row)
 	end
 
 	stmt:reset()
@@ -1044,10 +1181,7 @@ function ex_methods.take_inbox(self, id, amount)
 	local red_stmt = self.stmts.red_inbox_stmt
 	local del_stmt = self.stmts.del_inbox_stmt
 
-	get_stmt:bind_names({
-		id = id,
-		change = amount
-	})
+	get_stmt:bind_names({ id = id })
 
 	local res = get_stmt:step()
 
@@ -1066,44 +1200,34 @@ function ex_methods.take_inbox(self, id, amount)
 
 	db:exec("BEGIN TRANSACTION;")
 
+	local red_del_stmt
+
 	if available > amount then
 		red_stmt:bind_names({
-			id = id,
+			id     = id,
 			change = amount
 		})
 
-		local red_res = red_stmt:step()
-
-		if red_res == sqlite3.BUSY then
-			red_stmt:reset()
-			db:exec("ROLLBACK;")
-			return false, "Database Busy."
-		elseif red_res ~= sqlite3.DONE then
-			sql_error(db:errmsg())
-		end
-
-		red_stmt:reset()
+		red_del_stmt = red_stmt
 	else
-		del_stmt:bind_names({
-			id = id,
-		})
-
-		local del_res = del_stmt:step()
-
-		if del_res == sqlite3.BUSY then
-			del_stmt:reset()
-			db:exec("ROLLBACK;")
-			return false, "Database Busy."
-		elseif del_res ~= sqlite3.DONE then
-			sql_error(db:errmsg())
-		end
-
-		del_stmt:reset()
+		del_stmt:bind_values(id)
+		red_del_stmt = del_stmt
 	end
+
+	local red_del_res = red_del_stmt:step()
+
+	if red_del_res == sqlite3.BUSY then
+		red_del_stmt:reset()
+		db:exec("ROLLBACK;")
+		return false, "Database Busy."
+	elseif red_del_res ~= sqlite3.DONE then
+		sql_error(db:errmsg())
+	end
+
+	red_del_stmt:reset()
 
 	db:exec("COMMIT;")
 	return true, math.min(amount, available)
-
 end
 
 
@@ -1116,16 +1240,15 @@ end
 function ex_methods.market_summary(self)
 	local stmt = self.stmts.summary_stmt
 
-	local res,n = {},1
+	local res = {}
 	for a in stmt:rows() do
-		res[n] = {
-			item_name = a[1],
-			buy_volume = a[2],
-			buy_max = a[3],
+		table.insert(res, {
+			item_name   = a[1],
+			buy_volume  = a[2],
+			buy_max     = a[3],
 			sell_volume = a[4],
-			sell_min = a[5],
-		}
-		n = n+1
+			sell_min    = a[5],
+		})
 	end
 	stmt:reset()
 
@@ -1136,13 +1259,12 @@ end
 -- Returns a list of log entries, sorted by time.
 function ex_methods.player_log(self, p_name)
 	local stmt = self.stmts.transaction_log_stmt
-	stmt:bind_names({ p_name = p_name })
+	stmt:bind_values(p_name)
 
-	local res,n = {},1
+	local res = {}
 
 	for row in stmt:nrows() do
-		res[n] = row
-		n = n+1
+		table.insert(res, row)
 	end
 
 	stmt:reset()
@@ -1199,12 +1321,12 @@ function exports.test()
 
 	-- Simulate a transaction
 	print("Alice posting an offer to buy 10 cobble at 2 credits each")
-	local succ, err = ex:buy("Alice", "", "default:cobble", 10, 2)
+	local succ, err = ex:buy("Alice", "", "default:cobble", 32767, 10, 2)
 	print("Success: ", succ, " ", err)
 	print_balances()
 
 	print("Bob posting an offer to sell 20 cobble at 1 credits each")
-	local succ, err = ex:sell("Bob", "", "default:cobble", 20, 1)
+	local succ, err = ex:sell("Bob", "", "default:cobble", 32767, 20, 1)
 	print("Success: ", succ, " ", err)
 	print_balances()
 
@@ -1213,3 +1335,4 @@ end
 
 
 return exports
+-- vim:set ts=4 sw=4 noet:

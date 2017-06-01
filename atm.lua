@@ -1,117 +1,113 @@
 -- A telling machine. Call this file with the exchange argument.
-local exchange = ...
+local exchange, formlib = ...
 
 local atm_form = "global_exchange:atm_form"
 
-local main_menu =[[
-size[6,2]
-button[2,0;2,1;info;Account Info]
-button[4,0;2,1;wire;Wire Monies]
-button[1,1;4,1;transaction_log;Transaction Log]
-]]
+
+local unique = (function(unique_num)
+	return function()
+		unique_num = unique_num + 1
+		return unique_num
+	end
+end)(0)
 
 
-local function logout(x,y)
-	return "button[" .. x .. "," .. y .. ";2,1;logout;Log Out]"
-end
-
-
-local function label(x,y,text)
-	return "label[" .. x .. "," .. y .. ";"
-		.. minetest.formspec_escape(text) .. "]"
-end
-
-local function field(x,y, w,h, name, label, default)
-	return "field[" .. x .. "," .. y .. ";" .. w .. "," .. h .. ";"
-		.. name .. ";" .. minetest.formspec_escape(label) .. ";"
-		.. minetest.formspec_escape(default) .. "]"
-end
-
-local unique_num = 1
-
-local function unique()
-	local ret = unique_num
-	unique_num = unique_num + 1
-
-	return ret
-end
-
-
-local function info_fs(p_name)
+local function info_fs(fs, p_name)
 	local balance = exchange:get_balance(p_name)
 
-	local fs
-	if not balance then
-		fs = label(0.5,0.5, "You don't have an account.")
+	fs:size(4,3)
+
+	if balance then
+		fs:label(0.5,0.5, "Balance: " .. balance)
 	else
-		fs = label(0.5,0.5, "Balance: " .. balance)
+		fs:label(0.5,0.5, "You don't have an account.")
 	end
 
-	return "size[4,3]" .. fs .. logout(0.5,2)
+	fs:button(1,2, 2,1, "logout", "Log Out")
 end
 
 
-local function wire_fs(p_name)
+local function wire_fs(fs, p_name)
 	local balance = exchange:get_balance(p_name)
 
-	local fs = "size[4,5]" .. logout(0,4)
+	fs:size(4,5)
 
-	if not balance then
-		return fs .. label(0.5,0.5, "You don't have an account.")
+	if balance then
+		-- To prevent duplicates
+		fs:field(-100, -100, 0,0, "trans_id", "", unique())
+
+		fs:label(0.50,0.325, "Balance: " .. balance)
+		fs:field(0.75,1.750, 3,1, "recipient", "Send to:", "")
+		fs:field(0.75,3.000, 3,1, "amount", "Amount", "")
+
+		fs:button(0,4.25, 2,1, "logout", "Log Out")
+		fs:button(2,4.25, 2,1, "send", "Send")
+	else
+		fs:button(0,4, 2,1, "logout", "Back")
+		fs:label(0.5,0.5, "You don't have an account.")
 	end
-
-	-- To prevent duplicates
-	return fs .. field(-100, -100, 0,0, "trans_id", "", unique()) ..
-		label(0.5,0.5, "Balance: " .. balance) ..
-		field(0.5,1.5, 2,1, "recipient", "Send to:", "") ..
-		field(0.5,2.5, 2,1, "amount", "Amount", "") ..
-		"button[2,4;2,1;send;Send]"
 end
 
 
-local function send_fs(p_name, receiver, amt_str)
-	local fs = "size[7,3]"
+local function send_fs(fs, p_name, receiver, amt_str)
+	fs:size(10,3)
+
+	fs:button(4,2, 2,1, "wire", "Back")
 
 	local amt = tonumber(amt_str)
+	local msg = nil
 
 	if not amt or amt <= 0 then
-		return fs .. label(0.5,0.5, "Invalid transfer amount.") ..
-			"button[0.5,2;2,1;wire;Back]"
+		msg = "Invalid transfer amount."
+	else
+		local succ, err = exchange:transfer_credits(p_name, receiver, amt)
+
+		if not succ then
+			msg = "Error: " .. err
+		else
+			msg = "Successfully sent " .. amt ..
+				" credits to " .. receiver .. "."
+		end
 	end
 
-	local succ, err = exchange:transfer_credits(p_name, receiver, amt)
-
-	if not succ then
-		return fs .. label(0.5,0.5, "Error: " .. err) ..
-			"button[0.5,2;2,1;wire;Back]"
-	end
-	return fs.. label(0.5,0.5, "Successfully sent " ..
-		amt .. " credits to " .. receiver) ..
-		"button[0.5,2;2,1;wire;Back]"
+	fs:label(0.5,0.5, msg)
 end
 
 
-local function log_fs(p_name)
-	local res = {
-		"size[8,8]label[0,0;Transaction Log]button[0,7;2,1;logout;Log Out]",
-		"tablecolumns[text;text]",
-		"table[0,1;8,6;log_table;Time,Message",
-	}
+local function log_fs(fs, p_name)
+	fs:size(14,8)
 
-	for i, entry in ipairs(exchange:player_log(p_name)) do
-		i = i*4
-		res[i] = ","
-		res[i+1] = tostring(entry.Time)
-		res[i+2] = ","
-		res[i+3] = entry.Message
+	fs:label(0,0, "Transaction Log")
+
+	fs("tablecolumns[text;text]")
+	fs("table[0,0.75;13.75,6.75;log_table;Time,Message")
+
+	for _, entry in ipairs(exchange:player_log(p_name)) do
+		fs(",", formlib.escape(entry.Time), ",", formlib.escape(entry.Message))
 	end
-	res[#res+1] ="]"
 
-	return table.concat(res)
+	fs("]")
+
+	fs:button(6,7.5, 2,1, "logout", "Log Out")
+end
+
+
+local function main_menu_fs(fs, p_name)
+	fs:size(6,2)
+	fs:button(0.50,0.125, 2.5,1, "info", "Account Info")
+	fs:button(3.00,0.125, 2.5,1, "wire", "Wire Monies")
+	fs:button(0.50,1.125, 5.0,1, "transaction_log", "Transaction Log")
 end
 
 
 local trans_ids = {}
+
+
+local function show_atm_form(fs_fn, p_name, ...)
+	local fs = formlib.Builder()
+	fs_fn(fs, p_name, ...)
+	minetest.show_formspec(p_name, atm_form, tostring(fs))
+end
 
 
 minetest.register_on_player_receive_fields(function(player, formname, fields)
@@ -129,24 +125,15 @@ minetest.register_on_player_receive_fields(function(player, formname, fields)
 	trans_ids[p_name] = this_id
 
 	if fields.logout then
-		minetest.show_formspec(p_name, atm_form, main_menu)
-	end
-
-	if fields.info then
-		minetest.show_formspec(p_name, atm_form, info_fs(p_name))
-	end
-
-	if fields.wire then
-		minetest.show_formspec(p_name, atm_form, wire_fs(p_name))
-	end
-
-	if fields.send then
-		minetest.show_formspec(p_name, atm_form,
-			send_fs(p_name, fields.recipient, fields.amount))
-	end
-
-	if fields.transaction_log then
-		minetest.show_formspec(p_name, atm_form, log_fs(p_name))
+		show_atm_form(main_menu_fs, p_name)
+	elseif fields.info then
+		show_atm_form(info_fs, p_name)
+	elseif fields.wire then
+		show_atm_form(wire_fs, p_name)
+	elseif fields.send then
+		show_atm_form(send_fs, p_name, fields.recipient, fields.amount)
+	elseif fields.transaction_log then
+		show_atm_form(log_fs, p_name)
 	end
 
 	return true
@@ -180,16 +167,16 @@ minetest.register_node("global_exchange:atm_bottom", {
 	selection_box = {
 		type = "fixed",
 		fixed = {
-			{-0.5, -0.5, -0.5, 0.5, 0.5, 0.5},
-			{-0.5, 0.5, -0.5, -0.375, 1.125, -0.25},
-			{0.375, 0.5, -0.5, 0.5, 1.125, -0.25},
-			{-0.5, 0.5, -0.25, 0.5, 1.5, 0.5},
-			{-0.5, 1.125, -0.4375, -0.375, 1.25, -0.25},
-			{0.375, 1.125, -0.4375, 0.5, 1.25, -0.25},
-			{-0.5, 1.25, -0.375, -0.375, 1.375, -0.25},
-			{0.375, 1.25, -0.375, 0.5, 1.375, -0.25},
-			{-0.5, 1.375, -0.3125, -0.375, 1.5, -0.25},
-			{0.375, 1.375, -0.3125, 0.5, 1.5, -0.25},
+			{-0.500, -0.500, -0.5000,  0.500, 0.500,  0.50},
+			{-0.500,  0.500, -0.5000, -0.375, 1.125, -0.25},
+			{ 0.375,  0.500, -0.5000,  0.500, 1.125, -0.25},
+			{-0.500,  0.500, -0.2500,  0.500, 1.500,  0.50},
+			{-0.500,  1.125, -0.4375, -0.375, 1.250, -0.25},
+			{ 0.375,  1.125, -0.4375,  0.500, 1.250, -0.25},
+			{-0.500,  1.250, -0.3750, -0.375, 1.375, -0.25},
+			{ 0.375,  1.250, -0.3750,  0.500, 1.375, -0.25},
+			{-0.500,  1.375, -0.3125, -0.375, 1.500, -0.25},
+			{ 0.375,  1.375, -0.3125,  0.500, 1.500, -0.25},
 		},
 	},
 	on_place = function(itemstack, placer, pointed_thing)
@@ -233,7 +220,7 @@ minetest.register_node("global_exchange:atm_bottom", {
 	groups = {cracky=2, atm = 1},
 	on_rightclick = function(pos, _, clicker)
 		minetest.sound_play("atm_beep", {pos = pos, gain = 0.3, max_hear_distance = 5})
-		minetest.show_formspec(clicker:get_player_name(), atm_form, main_menu)
+		show_atm_form(main_menu_fs, clicker:get_player_name())
 	end,
 })
 
@@ -254,15 +241,15 @@ minetest.register_node("global_exchange:atm_top", {
 	node_box = {
 		type = "fixed",
 		fixed = {
-			{-0.5, -0.5, -0.5, -0.375, 0.125, -0.25},
-			{0.375, -0.5, -0.5, 0.5, 0.125, -0.25},
-			{-0.5, -0.5, -0.25, 0.5, 0.5, 0.5},
-			{-0.5, 0.125, -0.4375, -0.375, 0.25, -0.25},
-			{0.375, 0.125, -0.4375, 0.5, 0.25, -0.25},
-			{-0.5, 0.25, -0.375, -0.375, 0.375, -0.25},
-			{0.375, 0.25, -0.375, 0.5, 0.375, -0.25},
-			{-0.5, 0.375, -0.3125, -0.375, 0.5, -0.25},
-			{0.375, 0.375, -0.3125, 0.5, 0.5, -0.25},
+			{-0.500, -0.500, -0.5000, -0.375, 0.125, -0.25},
+			{ 0.375, -0.500, -0.5000,  0.500, 0.125, -0.25},
+			{-0.500, -0.500, -0.2500,  0.500, 0.500,  0.50},
+			{-0.500,  0.125, -0.4375, -0.375, 0.250, -0.25},
+			{ 0.375,  0.125, -0.4375,  0.500, 0.250, -0.25},
+			{-0.500,  0.250, -0.3750, -0.375, 0.375, -0.25},
+			{ 0.375,  0.250, -0.3750,  0.500, 0.375, -0.25},
+			{-0.500,  0.375, -0.3125, -0.375, 0.500, -0.25},
+			{ 0.375,  0.375, -0.3125,  0.500, 0.500, -0.25},
 		}
 	},
 	selection_box = {
@@ -278,10 +265,11 @@ minetest.register_node("global_exchange:atm_top", {
 minetest.register_craft( {
 	output = "global_exchange:atm",
 	recipe = {
-		{ "default:stone", "default:stone", "default:stone" },
+		{ "default:stone", "default:stone",      "default:stone" },
 		{ "default:stone", "default:gold_ingot", "default:stone" },
-		{ "default:stone", "default:stone", "default:stone" },
+		{ "default:stone", "default:stone",      "default:stone" },
 	}
 })
 
 minetest.register_alias("global_exchange:atm", "global_exchange:atm_bottom")
+-- vim:set ts=4 sw=4 noet:
