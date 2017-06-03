@@ -33,7 +33,7 @@ local function wire_fs(fs, p_name)
 	fs:size(4,5)
 
 	if balance then
-		-- To prevent duplicates
+		-- To detect duplicate/stale form submission
 		fs:field(-100, -100, 0,0, "trans_id", "", unique())
 
 		fs:label(0.50,0.325, "Balance: " .. balance)
@@ -79,13 +79,12 @@ local function log_fs(fs, p_name)
 
 	fs:label(0,0, "Transaction Log")
 
-	fs("tablecolumns[text;text]")
+	fs:element("tablecolumns", "text", "text")
+
 	fs("table[0,0.75;13.75,6.75;log_table;Time,Message")
-
 	for _, entry in ipairs(exchange:player_log(p_name)) do
-		fs(",", formlib.escape(entry.Time), ",", formlib.escape(entry.Message))
+		fs(","):escape_list(entry.Time, entry.Message)
 	end
-
 	fs("]")
 
 	fs:button(6,7.5, 2,1, "logout", "Log Out")
@@ -100,9 +99,6 @@ local function main_menu_fs(fs, p_name)
 end
 
 
-local trans_ids = {}
-
-
 local function show_atm_form(fs_fn, p_name, ...)
 	local fs = formlib.Builder()
 	fs_fn(fs, p_name, ...)
@@ -110,15 +106,18 @@ local function show_atm_form(fs_fn, p_name, ...)
 end
 
 
+local trans_ids = {}
+
 minetest.register_on_player_receive_fields(function(player, formname, fields)
 	if formname ~= atm_form then return end
 	if fields.quit then return true end
 
 	local p_name = player:get_player_name()
 
-	local this_id = fields.trans_id
+	local this_id = tonumber(fields.trans_id)
 
-	if this_id and this_id == trans_ids[p_name] then
+	if this_id and trans_ids[p_name] and this_id <= trans_ids[p_name] then
+		-- Ignore duplicate/stale form submittal
 		return true
 	end
 

@@ -9,26 +9,40 @@ local function is_integer(x)
 	return math.floor(x) == x
 end
 
+local function wear_string(wear)
+	if wear > 0 then
+		return "-" .. math.ceil(100 * wear / 65535) .. "%"
+	else
+		return "----"
+	end
+end
+
 local summary_fs = ""
 local function mk_summary_fs()
 	local fs = formlib.Builder()
 
-	fs("tablecolumns[text;text;text;text;text;text]")
-	fs("table[0,0;11.75,9;summary_table;")
-	fs("Item,Description,Buy Vol,Buy Max,Sell Vol,Sell Min")
+	fs:tablecolumns("text", "text", "text", "text", "text", "text", "text")
+	fs:table(0,0, 11.75,9, "summary_table", function(add_row)
+		add_row("Item",
+		        "Description",
+				"Wear",
+		        "Buy Vol",
+		        "Buy Max",
+		        "Sell Vol",
+		        "Sell Min")
 
-	local all_items = minetest.registered_items
-	for i, row in ipairs(exchange:market_summary()) do
-		local def = all_items[row.item_name] or {}
-		fs(",", formlib.escape(row.item_name))
-		fs(",", formlib.escape(def.description or "Unknown Item"))
-		fs(",", formlib.escape(row.buy_volume  or 0))
-		fs(",", formlib.escape(row.buy_max     or "N/A"))
-		fs(",", formlib.escape(row.sell_volume or 0))
-		fs(",", formlib.escape(row.sell_min    or "N/A"))
-	end
-
-	fs("]")
+		local all_items = minetest.registered_items
+		for i, row in ipairs(exchange:market_summary()) do
+			local def = all_items[row.Item] or {}
+			add_row(row.Item,
+			        def.description or "Unknown Item",
+					wear_string(row.Wear),
+			        row.Buy_Volume  or 0,
+			        row.Buy_Max     or "N/A",
+			        row.Sell_Volume or 0,
+			        row.Sell_Min    or "N/A")
+		end
+	end)
 
 	summary_fs = tostring(fs)
 end
@@ -56,10 +70,6 @@ local wear_levels = {
 -- Allow lookup by text label as well as index
 for _,v in ipairs(wear_levels) do
 	wear_levels[tostring(v.text)] = v
-end
-
-local function wear_string(wear)
-	return "-" .. math.ceil(100 * wear / 65535) .. "%"
 end
 
 
@@ -108,30 +118,20 @@ end)
 local main_form = "global_exchange:exchange_main"
 
 local function table_from_results(fs, results, name, x, y, w, h, selected)
-	fs("tablecolumns[text;text;text;text;text;text;text]")
-	fs("table[", x, ",", y, ";", w, ",", h, ";")
-	fs(formlib.escape(name), ";")
-	fs("Poster,Type,Item,Description,Wear,Amount,Rate")
+	fs:tablecolumns("text", "text", "text", "text", "text", "text", "text")
+	fs:table(x,y, w,h, name, function(add_row)
+		add_row("Poster", "Type", "Item",
+		        "Description",
+				"Wear", "Amount", "Rate")
 
-	local all_items = minetest.registered_items
-
-	for i, row in ipairs(results) do
-		local def = all_items[row.Item] or {}
-		fs(",", formlib.escape(row.Poster))
-		fs(",", formlib.escape(row.Type))
-		fs(",", formlib.escape(row.Item))
-		fs(",", formlib.escape(def.description or "Unknown Item"))
-		if row.Wear > 0 then
-			fs(",", formlib.escape("-" .. math.ceil(100 * row.Wear / 65535) .. "%"))
-		else
-			fs(",---")
+		local all_items = minetest.registered_items
+		for i, row in ipairs(results) do
+			local def = all_items[row.Item] or {}
+			add_row(row.Poster, row.Type, row.Item,
+			        def.description or "Unknown Item",
+					wear_string(row.Wear), row.Amount, row.Rate)
 		end
-		fs(",", formlib.escape(row.Amount))
-		fs(",", formlib.escape(row.Rate))
-	end
-
-	local sel_num = math.max(0, tonumber(selected) or 0)
-	fs(";", sel_num + 1, "]")
+	end, math.max(0, tonumber(selected) or 0) + 1)
 end
 
 local function mk_main_market_fs(fs, p_name, state)
@@ -141,22 +141,13 @@ end
 local function mk_main_order_book_fs(fs, p_name, x, y, w, h, item_name)
 	local order_book = exchange:order_book("", item_name)
 
-	fs("tablecolumns[text;text;text;text]")
-	fs("table[", x, ",", y, ";", w, ",", h, ";", "order_book;")
-	fs("Type,Rate,Wear,Amount")
-
-	for _,row in ipairs(order_book) do
-		fs(",", formlib.escape(row.Type))
-		fs(",", formlib.escape(row.Rate))
-		if row.Wear > 0 then
-			fs(",", formlib.escape(wear_string(row.Wear)))
-		else
-			fs(",---")
+	fs:tablecolumns("text", "text", "text", "text")
+	fs:table(x,y, w,h, "order_book", function(add_row)
+		add_row("Type", "Rate", "Wear", "Amount")
+		for _,row in ipairs(order_book) do
+			add_row(row.Type, row.Rate, wear_string(row.Wear), row.Amount)
 		end
-		fs(",", formlib.escape(row.Amount))
-	end
-
-	fs(";1]")
+	end, 1)
 end
 
 local function mk_main_buy_fs(fs, p_name, state)
@@ -167,14 +158,11 @@ local function mk_main_buy_fs(fs, p_name, state)
 	fs:field(10.25,0.40, 2,1, "buy_amount", "Quantity", state.buy_amount, false)
 
 	local wear = wear_levels[state.buy_wear] or wear_levels[1]
-	fs("dropdown[9,1;3;buy_wear;")
-	local sep = nil
-	for _,v in ipairs(wear_levels) do
-		if sep then fs(sep) end
-		fs:escape(v.text)
-		sep = ","
-	end
-	fs(";", wear.index, "]")
+	fs:dropdown(9,1, 3, "buy_wear", function(add_item)
+		for _,v in ipairs(wear_levels) do
+			add_item(v.text)
+		end
+	end, wear.index)
 
 	fs:field(9.35,2.40, 2.9,1, "buy_price", "Bid (ea.)", state.buy_price, false)
 
@@ -241,14 +229,11 @@ local function mk_main_fs(fs, p_name, err_str, success)
 	fs:size(12,10)
 	fs:bgcolor("#606060", false)
 
-	fs("tabheader[0,0.65;tab;")
-	local sep = nil
-	for _,tab in ipairs(main_tabs) do
-		if sep then fs(sep) end
-		fs:escape(tab.text)
-		sep = ","
-	end
-	fs(";", state.tab or 1, ";false;true]")
+	fs:tabheader(0,0.65, "tab", function(add_tab)
+		for _,tab in ipairs(main_tabs) do
+			add_tab(tab.text)
+		end
+	end, state.tab or 1, false, true)
 
 	local bal = exchange:get_balance(p_name)
 	fs:label(0,0.37, "Balance: " .. bal)

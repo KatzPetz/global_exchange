@@ -26,19 +26,15 @@ end
 
 
 local function mk_inbox_list(fs, results, x, y, w, h)
-	fs("textlist[", x, ",", y, ";", w, ",", h, ";result_list;")
-
-	local sep = nil
-	for i, row in ipairs(results) do
-		fs(sep)
-		fs:escape(row.Amount, " ", row.Item)
-		if row.Wear > 0 then
-			fs:escape(" (", wear_string(row.Wear), ")")
+	fs:textlist(x,y, w,h, "result_list", function(add_row)
+		for i, row in ipairs(results) do
+			local wear_suffix = nil
+			if row.Wear > 0 then
+				wear_suffix = " (" .. wear_string(row.Wear) .. ")"
+			end
+			add_row(row.Amount, " ", row.Item, wear_suffix)
 		end
-		sep = ","
-	end
-
-	fs("]")
+	end)
 end
 
 

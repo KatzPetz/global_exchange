@@ -16,13 +16,13 @@ end)({})
 
 local init_query = [=[
 BEGIN TRANSACTION;
-CREATE TABLE if not exists Credit
+CREATE TABLE IF NOT EXISTS Credit
 (
 	Owner TEXT PRIMARY KEY NOT NULL,
 	Balance INTEGER NOT NULL
 );
 
-CREATE TABLE if not exists Log
+CREATE TABLE IF NOT EXISTS Log
 (
 	Id INTEGER PRIMARY KEY AUTOINCREMENT,
 	Recipient TEXT NOT NULL,
@@ -30,7 +30,7 @@ CREATE TABLE if not exists Log
 	Message TEXT NOT NULL
 );
 
-CREATE TABLE if not exists Orders
+CREATE TABLE IF NOT EXISTS Orders
 (
 	Id INTEGER PRIMARY KEY AUTOINCREMENT,
 	Poster TEXT NOT NULL,
@@ -43,7 +43,7 @@ CREATE TABLE if not exists Orders
 	Rate INTEGER NOT NULL CHECK(Rate > 0)
 );
 
-CREATE TABLE if not exists Inbox
+CREATE TABLE IF NOT EXISTS Inbox
 (
 	Id INTEGER PRIMARY KEY AUTOINCREMENT,
 	Recipient TEXT NOT NULL,
@@ -52,44 +52,49 @@ CREATE TABLE if not exists Inbox
 	Amount INTEGER NOT NULL CHECK(Amount > 0)
 );
 
-CREATE INDEX if not exists index_log
+CREATE INDEX IF NOT EXISTS index_log
 ON Log (Recipient, Time);
 
-CREATE INDEX if not exists index_orders
+CREATE INDEX IF NOT EXISTS index_orders
 ON Orders (Exchange, Type, Item, Rate, Wear, Time);
 
-CREATE INDEX if not exists index_own_orders
+CREATE INDEX IF NOT EXISTS index_own_orders
 ON Orders (Poster, Time);
 
-CREATE INDEX if not exists index_inbox
+CREATE INDEX IF NOT EXISTS index_inbox
 ON Inbox (Recipient, Item, Wear);
 
-CREATE VIEW if not exists distinct_items AS
-SELECT DISTINCT Item FROM Orders;
+CREATE VIEW IF NOT EXISTS distinct_items AS
+SELECT DISTINCT Item, Wear FROM Orders;
 
-CREATE VIEW if not exists market_summary AS
+CREATE VIEW IF NOT EXISTS market_summary AS
 SELECT
-  distinct_items.Item,
+  distinct_items.Item AS Item,
+  distinct_items.Wear AS Wear,
   (
-    SELECT sum(Orders.Amount) FROM Orders
+    SELECT SUM(Orders.Amount) FROM Orders
     WHERE Orders.Item = distinct_items.Item
+	AND Orders.Wear >= distinct_items.Wear
     AND Orders.Type = "buy"
-  ),
+  ) AS Buy_Volume,
   (
-    SELECT max(Orders.Rate) FROM Orders
+    SELECT MAX(Orders.Rate) FROM Orders
     WHERE Orders.Item = distinct_items.Item
+	AND Orders.Wear >= distinct_items.Wear
     AND Orders.Type = "buy"
-  ),
+  ) AS Buy_Max,
   (
-    SELECT sum(Orders.Amount) FROM Orders
+    SELECT SUM(Orders.Amount) FROM Orders
     WHERE Orders.Item = distinct_items.Item
+	AND Orders.Wear <= distinct_items.Wear
     AND Orders.Type = "sell"
-  ),
+  ) AS Sell_Volume,
   (
-    SELECT min(Orders.Rate) FROM Orders
+    SELECT MIN(Orders.Rate) FROM Orders
     WHERE Orders.Item = distinct_items.Item
+	AND Orders.Wear <= distinct_items.Wear
     AND Orders.Type = "sell"
-  )
+  ) AS Sell_Min
 FROM distinct_items;
 
 
@@ -1241,14 +1246,8 @@ function ex_methods.market_summary(self)
 	local stmt = self.stmts.summary_stmt
 
 	local res = {}
-	for a in stmt:rows() do
-		table.insert(res, {
-			item_name   = a[1],
-			buy_volume  = a[2],
-			buy_max     = a[3],
-			sell_volume = a[4],
-			sell_min    = a[5],
-		})
+	for a in stmt:nrows() do
+		table.insert(res, a)
 	end
 	stmt:reset()
 
