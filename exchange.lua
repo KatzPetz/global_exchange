@@ -885,7 +885,7 @@ function ex_methods.buy(self, p_name, ex_name, item_name, wear, amount, rate)
 		if poster ~= p_name then
 			local can_afford = math.floor(balance / row_rate)
 			last_row_rate = row_rate
-			out_of_funds = row_bought < can_afford
+			out_of_funds = can_afford < row_bought
 			row_bought = math.min(row_bought, can_afford)
 			-- asking prices can only increase from here
 			if row_bought == 0 then break end
@@ -1057,14 +1057,7 @@ function ex_methods.sell(self, p_name, ex_name, item_name, wear, amount, rate)
 		local out_of_funds = false
 
 		if poster ~= p_name then
-			local bal = self:get_balance(poster)
-
-			if not bal then
-				search_stmt:reset()
-				db:exec("ROLLBACK;")
-				return false, poster .. " does not have an account."
-			end
-
+			local bal = self:get_balance(poster) or 0
 			local can_afford = math.floor(bal / row_rate)
 			out_of_funds = can_afford < row_sold
 			row_sold = math.min(row_sold, can_afford)
