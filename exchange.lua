@@ -861,6 +861,8 @@ function ex_methods.buy(self, p_name, ex_name, item_name, wear, amount, rate)
 
 	local bought = {}
 	local remaining = amount
+	local out_of_funds = false
+	local last_row_rate = rate
 
 	local del_stmt = self.stmts.del_order_stmt
 	local red_stmt = self.stmts.reduce_order_stmt
@@ -882,6 +884,8 @@ function ex_methods.buy(self, p_name, ex_name, item_name, wear, amount, rate)
 
 		if poster ~= p_name then
 			local can_afford = math.floor(balance / row_rate)
+			last_row_rate = row_rate
+			out_of_funds = row_bought < can_afford
 			row_bought = math.min(row_bought, can_afford)
 			-- asking prices can only increase from here
 			if row_bought == 0 then break end
@@ -933,7 +937,7 @@ function ex_methods.buy(self, p_name, ex_name, item_name, wear, amount, rate)
 			balance = balance - cost
 
 			local log_succ, log_err =
-				self:log(p_name .. " bought " .. row_amount .. " " ..
+				self:log(p_name .. " bought " .. row_bought .. " " ..
 						item_name .. " from you. (+" .. cost .. ")",
 						poster)
 			if not log_succ then
@@ -943,7 +947,7 @@ function ex_methods.buy(self, p_name, ex_name, item_name, wear, amount, rate)
 			end
 
 			local log_succ, log_err =
-				self:log("Bought " .. row_amount .. " " .. item_name ..
+				self:log("Bought " .. row_bought .. " " .. item_name ..
 						" from " .. poster .. ". (-" .. cost .. ")",
 						p_name)
 			if not log_succ then
@@ -953,7 +957,7 @@ function ex_methods.buy(self, p_name, ex_name, item_name, wear, amount, rate)
 			end
 		else
 			local log_succ, log_err =
-				self:log("Bought " .. row_amount .. " " ..
+				self:log("Bought " .. row_bought .. " " ..
 				         item_name .. " from yourself.",
 				         p_name)
 			if not log_succ then
@@ -969,27 +973,38 @@ function ex_methods.buy(self, p_name, ex_name, item_name, wear, amount, rate)
 
 		remaining = remaining - row_bought
 
-		if remaining == 0 then break end
+		if remaining == 0 or out_of_funds then break end
 	end
 
 	search_stmt:reset()
 
 	if remaining > 0 then
-		local add_succ, add_err =
-			self:add_order(p_name, ex_name, "buy", item_name, wear, remaining, rate)
+		if out_of_funds then
+			local log_succ, log_err =
+				self:log("Insufficient funds to buy " .. remaining .. " " ..
+						item_name .. " at " .. last_row_rate .. "/ea.",
+						p_name)
+			if not log_succ then
+				db:exec("ROLLBACK;")
+				return false, log_err
+			end
+		else
+			local add_succ, add_err =
+				self:add_order(p_name, ex_name, "buy", item_name, wear, remaining, rate)
 
-		if not add_succ then
-			db:exec("ROLLBACK;")
-			return false, add_err
-		end
+			if not add_succ then
+				db:exec("ROLLBACK;")
+				return false, add_err
+			end
 
-		local log_succ, log_err =
-			self:log("Posted buy offer for " .. remaining .. " " ..
-			         item_name .. " at " .. rate .. "/ea.",
-					 p_name)
-		if not log_succ then
-			db:exec("ROLLBACK;")
-			return false, log_err
+			local log_succ, log_err =
+				self:log("Posted buy offer for " .. remaining .. " " ..
+						item_name .. " at " .. rate .. "/ea.",
+						p_name)
+			if not log_succ then
+				db:exec("ROLLBACK;")
+				return false, log_err
+			end
 		end
 	end
 
@@ -1039,6 +1054,8 @@ function ex_methods.sell(self, p_name, ex_name, item_name, wear, amount, rate)
 		local row_rate   = row.Rate
 		local row_sold   = math.min(row_amount, remaining)
 
+		local out_of_funds = false
+
 		if poster ~= p_name then
 			local bal = self:get_balance(poster)
 
@@ -1049,96 +1066,108 @@ function ex_methods.sell(self, p_name, ex_name, item_name, wear, amount, rate)
 			end
 
 			local can_afford = math.floor(bal / row_rate)
+			out_of_funds = can_afford < row_sold
 			row_sold = math.min(row_sold, can_afford)
 		end
 
-		if row_sold > 0 then
-			local red_del_stmt
+		local red_del_stmt
 
-			if row_sold < row_amount then
-				red_stmt:bind_names({
-					id    = row.Id,
-					delta = row_sold,
-				})
-				red_del_stmt = red_stmt
-			else -- row_sold == row_amount
-				del_stmt:bind_values(row.Id)
-				red_del_stmt = del_stmt
-			end
+		if row_sold < row_amount and not out_of_funds then
+			red_stmt:bind_names({
+				id    = row.Id,
+				delta = row_sold,
+			})
+			red_del_stmt = red_stmt
+		else -- row_sold == row_amount or out_of_funds
+			del_stmt:bind_values(row.Id)
+			red_del_stmt = del_stmt
+		end
 
-			local red_del_res = red_del_stmt:step()
-			red_del_stmt:reset()
-			if red_del_res == sqlite3.BUSY then
+		local red_del_res = red_del_stmt:step()
+		red_del_stmt:reset()
+		if red_del_res == sqlite3.BUSY then
+			search_stmt:reset()
+			db:exec("ROLLBACK;")
+			return false, "Database Busy."
+		elseif red_del_res ~= sqlite3.DONE then
+			search_stmt:reset()
+			sql_error(db:errmsg())
+		end
+
+		local in_succ, in_err =
+			self:put_in_inbox(poster, item_name, wear, row_sold)
+		if not in_succ then
+			search_stmt:reset()
+			db:exec("ROLLBACK;")
+			return false, in_err
+		end
+
+		if poster ~= p_name then
+			local revenue = row_sold * row_rate
+
+			local ch_succ, ch_err = self:change_balance(poster, -revenue)
+			if not ch_succ then
 				search_stmt:reset()
 				db:exec("ROLLBACK;")
-				return false, "Database Busy."
-			elseif red_del_res ~= sqlite3.DONE then
-				search_stmt:reset()
-				sql_error(db:errmsg())
+				return false, ch_err
 			end
 
-			local in_succ, in_err =
-				self:put_in_inbox(poster, item_name, wear, row_sold)
-			if not in_succ then
+			local ch_succ, ch_err = self:change_balance(p_name, revenue)
+			if not ch_succ then
 				search_stmt:reset()
 				db:exec("ROLLBACK;")
-				return false, in_err
+				return false, ch_err
 			end
 
-			if poster ~= p_name then
-				local revenue = row_sold * row_rate
+			local log_succ, log_err =
+				self:log(p_name .. " sold " .. row_sold .. " " ..
+						item_name .. " to you. (-" .. revenue .. ")",
+						poster)
+			if not log_succ then
+				search_stmt:reset()
+				db:exec("ROLLBACK;")
+				return false, log_err
+			end
 
-				local ch_succ, ch_err = self:change_balance(poster, -revenue)
-				if not ch_succ then
-					search_stmt:reset()
-					db:exec("ROLLBACK;")
-					return false, ch_err
-				end
-
-				local ch_succ, ch_err = self:change_balance(p_name, revenue)
-				if not ch_succ then
-					search_stmt:reset()
-					db:exec("ROLLBACK;")
-					return false, ch_err
-				end
-
+			if out_of_funds then
 				local log_succ, log_err =
-					self:log(p_name .. " sold " .. row_amount .. " " ..
-							item_name .. " to you. (-" .. revenue .. ")",
+					self:log("Insufficient funds to buy " ..
+							math.min(row_amount - row_sold, remaining) ..
+							" " .. item_name .. " from " .. p_name ..
+							" at " .. row_rate .. "/ea.",
 							poster)
 				if not log_succ then
-					search_stmt:reset()
-					db:exec("ROLLBACK;")
-					return false, log_err
-				end
-
-				local log_succ, log_err =
-					self:log("Sold " .. row_amount .. " " .. item_name ..
-							" to " .. poster .. "(+" .. revenue .. ")",
-							p_name)
-				if not log_succ then
-					search_stmt:reset()
-					db:exec("ROLLBACK;")
-					return false, log_err
-				end
-			else
-				local log_succ, log_err =
-					self:log("Sold " .. row_amount .. " " ..
-					         item_name .. " to yourself.",
-					         p_name)
-				if not log_succ then
-					search_stmt:reset()
 					db:exec("ROLLBACK;")
 					return false, log_err
 				end
 			end
 
-			order_book_cache(ex_name)[item_name] = nil
-
-			remaining = remaining - row_sold
-
-			if remaining == 0 then break end
+			local log_succ, log_err =
+				self:log("Sold " .. row_sold .. " " .. item_name ..
+						" to " .. poster .. "(+" .. revenue .. ")",
+						p_name)
+			if not log_succ then
+				search_stmt:reset()
+				db:exec("ROLLBACK;")
+				return false, log_err
+			end
+		else
+			local log_succ, log_err =
+				self:log("Sold " .. row_sold .. " " ..
+							item_name .. " to yourself.",
+							p_name)
+			if not log_succ then
+				search_stmt:reset()
+				db:exec("ROLLBACK;")
+				return false, log_err
+			end
 		end
+
+		order_book_cache(ex_name)[item_name] = nil
+
+		remaining = remaining - row_sold
+
+		if remaining == 0 then break end
 	end
 
 	search_stmt:reset()
