@@ -1137,7 +1137,7 @@ function ex_methods.sell(self, p_name, ex_name, item_name, wear, amount, rate)
 
 			local log_succ, log_err =
 				self:log("Sold " .. row_sold .. " " .. item_name ..
-						" to " .. poster .. "(+" .. revenue .. ")",
+						" to " .. poster .. ". (+" .. revenue .. ")",
 						p_name)
 			if not log_succ then
 				search_stmt:reset()
